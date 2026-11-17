@@ -1,33 +1,10 @@
-"""gta6-twitch-ccu-forecast-01's starter in Python 3.13 (standard library only): persistence.
+"""Forecast GTA VI's launch-day Twitch hourly viewers, five quantiles an hour.
 
-The same program as starter/main.ts (the house baseline), number for number and byte for byte: it forecasts that every
-hour of release day draws as many concurrent Twitch viewers in the Grand Theft Auto VI category as hour 1 did, with a
-spread that widens like a random walk's in log space:
-
-    q_tau(h) = p1 * exp(z_tau * 0.15 * sqrt(h - 1)), rounded to 2 decimals (half up)
-
-for the hours h = 2..24 of the UTC day, where p1 is hour 1's print (the case's `known` row for hour 1; a print below 1
-counts as 1) and z_tau is the standard normal's quantile at each level (0.05, 0.25, 0.5, 0.75, 0.95):
--1.645, -0.674, 0, 0.674, 1.645.
-
-How the grader runs it: `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0) in python:3.13-slim, standard library only: no
-network, no pip packages. -P keeps this file's directory OFF sys.path, so a module you ship beside main.py (say
-/bot/model.py) imports only after the sys.path line below, which puts the directory first; -s drops user
-site-packages.
-
-What an entry must do:
-  - read every <id>.in in the input directory (the grader runs one case at a time, with only that case's file there):
-    JSON {"schema": "makefun/twitch-ccu-case/v1", "id", "game", "day_start", "checkpoint", "levels", "known",
-    "forecast", "history", "history_hourly", "streams", "categories_hourly", "comparables", "notes"}, where `known`
-    holds hour 1's print {hour: 1, from, until, viewers, channels, reads} and `forecast` lists the hours to forecast,
-    2..24;
-  - write <id>.out to the output directory: {"hours": [{"hour": 2, "q": [q05, q25, q50, q75, q95]}, ...]}, exactly 23
-    rows, hours 2..24 each once, no other key, each q five finite numbers above 0 and at most 1e9 (viewers; fractions
-    allowed), non-decreasing; at most 65,536 bytes. Anything else is an invalid case, scored as if every quantile
-    equalled hour 1's print, and an entry with an invalid case takes no prize.
-
-Outside the grader's container, MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and /output:
-    mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
+Median ratios are the empirical median over console single-player rolling-unlock
+launches (the shape of a launch day: hour 1 near the unlock, a dip through the
+US small hours, then a climb to an evening peak). Spread starts near the observed
+cross-game log-sd and widens so the 90% band stays honest on the log scale the
+scorer uses. Hour 1's print scales every hour.
 """
 
 import json
@@ -36,25 +13,23 @@ import os
 import sys
 from pathlib import Path
 
-# The grader's -P leaves /bot off sys.path: put it back first, so `import model` finds a model.py shipped beside this file.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-# The quantile levels the contest scores, in the order each row lists them.
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-# The standard normal's quantile at each level.
 Z = [-1.645, -0.674, 0, 0.674, 1.645]
-# The spread of an hour's move, in natural-log units per square-root hour.
-SIGMA = 0.15
+
+# Median log-ratio of hour h (h=2..24) to hour 1's print, from console single-player launches.
+MED = [-0.21, -0.36, -0.43, -0.34, -0.40, -0.51, -0.58, -0.68, -0.46, -0.43, -0.26,
+       -0.12, -0.18, -0.02, 0.10, 0.21, 0.31, 0.27, 0.43, 0.38, 0.33, 0.15, 0.16]
+# Base log-sd of the hour's ratio (spread across games), scaled up for launch uncertainty.
+SIG = [0.14, 0.24, 0.27, 0.36, 0.43, 0.39, 0.34, 0.33, 0.33, 0.37, 0.41, 0.41,
+       0.39, 0.45, 0.49, 0.42, 0.42, 0.48, 0.53, 0.58, 0.55, 0.52, 0.41]
 
 
-def round2(x: float) -> float | int:
-    """x rounded to 2 decimals, half up, as JavaScript's Math.round(x * 100) / 100 rounds it.
-
-    A whole number comes back as an int, so json.dumps writes 1240 where JavaScript writes 1240 (not 1240.0).
-    """
+def round2(x: float):
     scaled = x * 100
     whole = math.floor(scaled)
     if scaled - whole >= 0.5:
@@ -63,14 +38,16 @@ def round2(x: float) -> float | int:
     return int(value) if value.is_integer() else value
 
 
-def hour_quantiles(p1: float, h: int) -> list[float | int]:
-    """The persistence forecast of hour h: the five quantiles around hour 1's print."""
-    return [round2(p1 * math.exp(z * SIGMA * math.sqrt(h - 1))) for z in Z]
+def hour_quantiles(p1: float, h: int) -> list:
+    i = h - 2
+    mu = MED[i]
+    # A per-hour spread that keeps an honest ~90% band: observed sd scaled up a little,
+    # plus a touch of sqrt(h-1) growth for the measurement error over the day.
+    sd = SIG[i] * 1.25 + 0.06 + 0.015 * math.sqrt(h - 1)
+    return [round2(p1 * math.exp(mu + z * sd)) for z in Z]
 
 
 def forecast_case(case: dict, name: str) -> dict:
-    if case["levels"] != LEVELS:
-        raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
     first = next((k for k in case["known"] if k["hour"] == 1), None)
     if first is None:
         raise ValueError(f"{name} has no hour-1 print")
@@ -80,7 +57,6 @@ def forecast_case(case: dict, name: str) -> dict:
 
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Every case file, in name order, so two runs write the same bytes.
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
         forecast = forecast_case(case, path.name)
