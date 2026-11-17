@@ -65,11 +65,26 @@ def round2(x: float):
 
 
 def hour_quantiles(p1: float, h: int) -> list:
-    """The five quantiles of hour h's count, given hour 1's print p1."""
+    """The five quantiles of hour h's count, given hour 1's print p1.
+
+    The quantiles come out of the log-normal as p1 * exp(location + z*scale)
+    for the five standard z values.  Two safety guards keep the answer valid
+    no matter what a stray case throws in:
+
+      * every quantile is clamped to be at least 1 (a viewer count can never
+        be sub-atomic), and
+      * the five are force-sorted, so a pathological SD that ever inverts the
+        90% band can never emit a "quantile" that walks backwards — the .05
+        result stays the smallest and the .95 the largest.
+
+    Both are idempotent on well-behaved input, so ordinary runs are untouched.
+    """
     i = h - 2
     location = MU[i]
     scale = SD[i]
-    return [round2(p1 * math.exp(location + z * scale)) for z in Z_AT_LEVEL]
+    raw = [p1 * math.exp(location + z * scale) for z in Z_AT_LEVEL]
+    quantiles = sorted(max(1.0, value) for value in raw)
+    return [round2(value) for value in quantiles]
 
 
 def forecast_case(case: dict, name: str) -> dict:
