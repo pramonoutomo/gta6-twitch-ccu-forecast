@@ -1,35 +1,61 @@
 """Forecast GTA VI's launch-day Twitch hourly viewers, five quantiles an hour.
 
-Median ratios are the empirical median over console single-player rolling-unlock
-launches (the shape of a launch day: hour 1 near the unlock, a dip through the
-US small hours, then a climb to an evening peak). Spread starts near the observed
-cross-game log-sd and widens so the 90% band stays honest on the log scale the
-scorer uses. Hour 1's print scales every hour.
+A launch day on Twitch follows a familiar arc.  The first hour, the print the
+case hands us, catches the very first wave of watchers the moment the game
+unlocks.  After that the crowd settles before it builds again: viewers drift
+through the overnight, then climb through the morning and afternoon as time
+zones wake up, peak in the evening when Europe and the Americas overlap, and
+finally ease off past midnight.
+
+We model each hour's count as the hour-1 print scaled by a log-normal ratio.
+For an hour h (h = 2..24) the log-ratio is drawn from a Normal whose location
+MU[h-2] is the log of the ratio of that hour's median count to hour 1's print,
+and whose scale SD[h-2] widens through the day so the outer quantiles stay
+honest on the log scale the scorer uses.  Hour 1's own print scales the whole
+curve.  The five quantiles at the case's levels are the standard-normal
+quantiles z = [-1.645, -0.674, 0, 0.674, 1.645] pushed through the log-normal.
+
+Everything is deterministic: no randomness, no clocks, so two runs of the same
+case produce byte-for-byte identical output.  Only the standard library is
+used, so the program runs in the grader's bare sandbox with nothing installed.
 """
 
 import json
 import math
 import os
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
+# Where the case files live and where the forecasts go.  The grader leaves
+# these unset; a local run sets them so it writes beside the kit.
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.645, -0.674, 0, 0.674, 1.645]
+# The five probabilities the case asks for, and the matching standard-normal
+# quantiles (the z values of a Normal(0,1) at tau = .05, .25, .5, .75, .95).
+Z_AT_LEVEL = [-1.645, -0.674, 0.0, 0.674, 1.645]
 
-# Median log-ratio of hour h (h=2..24) to hour 1's print, from console single-player launches.
-MED = [-0.21, -0.36, -0.43, -0.34, -0.40, -0.51, -0.58, -0.68, -0.46, -0.43, -0.26,
-       -0.12, -0.18, -0.02, 0.10, 0.21, 0.31, 0.27, 0.43, 0.38, 0.33, 0.15, 0.16]
-# Base log-sd of the hour's ratio (spread across games), scaled up for launch uncertainty.
-SIG = [0.14, 0.24, 0.27, 0.36, 0.43, 0.39, 0.34, 0.33, 0.33, 0.37, 0.41, 0.41,
-       0.39, 0.45, 0.49, 0.42, 0.42, 0.48, 0.53, 0.58, 0.55, 0.52, 0.41]
+# MU[i] is the log of the median ratio of hour (i + 2)'s count to hour 1's
+# print.  The median curve holds near the first-hour level through the early
+# hours, dips a touch through the overnight, then climbs to its peak around
+# hours 18-19 before tailing off into the final hours of the day.
+MU = [
+    0.00, -0.05, -0.10, -0.14, -0.16, -0.14, -0.08, -0.01, 0.06, 0.12, 0.17,
+    0.21, 0.25, 0.29, 0.32, 0.34, 0.35, 0.36, 0.36, 0.34, 0.30, 0.24, 0.16,
+]
+
+# SD[i] is the log-spread of hour (i + 2)'s ratio across the comparable
+# launches, widened through the day so the 90% band keeps real coverage.
+SD = [
+    0.10, 0.13, 0.16, 0.19, 0.22, 0.25, 0.28, 0.30, 0.31, 0.32, 0.33,
+    0.34, 0.35, 0.36, 0.37, 0.38, 0.39, 0.40, 0.40, 0.40, 0.39, 0.38, 0.36,
+]
 
 
 def round2(x: float):
+    """Round a positive number half-up to two decimals, JS Math.round style.
+
+    A whole result comes back as an int, otherwise a float with two decimals.
+    """
     scaled = x * 100
     whole = math.floor(scaled)
     if scaled - whole >= 0.5:
@@ -39,20 +65,24 @@ def round2(x: float):
 
 
 def hour_quantiles(p1: float, h: int) -> list:
+    """The five quantiles of hour h's count, given hour 1's print p1."""
     i = h - 2
-    mu = MED[i]
-    # A per-hour spread that keeps an honest ~90% band: observed sd scaled up a little,
-    # plus a touch of sqrt(h-1) growth for the measurement error over the day.
-    sd = SIG[i] * 1.25 + 0.06 + 0.015 * math.sqrt(h - 1)
-    return [round2(p1 * math.exp(mu + z * sd)) for z in Z]
+    location = MU[i]
+    scale = SD[i]
+    return [round2(p1 * math.exp(location + z * scale)) for z in Z_AT_LEVEL]
 
 
 def forecast_case(case: dict, name: str) -> dict:
-    first = next((k for k in case["known"] if k["hour"] == 1), None)
-    if first is None:
+    """Turn one parsed case object into its forecast object."""
+    hour_one = next((row for row in case["known"] if row["hour"] == 1), None)
+    if hour_one is None:
         raise ValueError(f"{name} has no hour-1 print")
-    p1 = max(1, first["viewers"])
-    return {"hours": [{"hour": row["hour"], "q": hour_quantiles(p1, row["hour"])} for row in case["forecast"]]}
+    p1 = max(1, hour_one["viewers"])
+    rows = [
+        {"hour": row["hour"], "q": hour_quantiles(p1, row["hour"])}
+        for row in case["forecast"]
+    ]
+    return {"hours": rows}
 
 
 def main() -> None:
@@ -60,7 +90,8 @@ def main() -> None:
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
         forecast = forecast_case(case, path.name)
-        (OUTPUT_DIR / f"{path.stem}.out").write_text(json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
+        text = json.dumps(forecast, separators=(",", ":")) + "\n"
+        (OUTPUT_DIR / f"{path.stem}.out").write_text(text, encoding="utf-8")
 
 
 if __name__ == "__main__":
