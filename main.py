@@ -1,34 +1,39 @@
-"""Forecast GTA VI's launch-day Twitch hourly viewers, five quantiles an hour.
+"""Forecast GTA VI's launch-day Twitch hourly viewers as five quantiles per hour.
 
-Each case carries a set of comparable big launches with their whole-hour viewer
-averages around their release day. For every comparable we read the 24-hour ratio
-curve of its release day to its own hour-1 print. The forecast's median for hour
-h is the cross-comparable median log-ratio, and the spread is the cross-comparable
-standard deviation of that log-ratio, so the 5%-95% band sits where a launch like
-this one usually lands: an honest, well-calibrated forecast on the log scale the
-scorer uses. Hour 1's print scales every hour, and nothing depends on randomness,
-so two runs write the same bytes.
+For every hour 2..24 of launch day we must publish the 5/25/50/75/95 percentiles
+of that hour's average viewer count. Each case supplies a set of comparable
+releases, every one carrying its own release-day start plus a long hourly
+viewer history. For each comparable we read the viewer print of each whole hour
+of its own release day, normalise the day by its hour-1 print, and take the 23
+log ratios ln(v_h / v_1). The forecast for hour h is a lognormal band: median =
+the cross-comparable median ratio, spread = the cross-comparable population
+standard deviation of that ratio (floored so the band never collapses). The
+case's own hour-1 print scales every hour of the band, so the whole forecast is
+a pure function of the input file: no randomness, no wall clock, and two runs
+write byte-identical output.
 """
 
 import datetime
 import json
 import math
 import os
-import statistics
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.645, -0.674, 0, 0.674, 1.645]
-HOUR_MS = 3_600_000
+HOURS = tuple(range(2, 25))               # the 23 forecast hours, 2..24 inclusive
+FIRST_HOUR = 1                            # the anchor a day is normalised by
+Z = [-1.645, -0.674, 0.0, 0.674, 1.645]   # normal quantiles of 5/25/50/75/95
+MIN_COMPARABLE_VIEWERS = 2000            # comparables nobody watched are noise
+SD_FLOOR = 0.12                           # log-ratio spread never collapses below this
+SD_FALLBACK = 0.20                        # log-ratio spread when nothing qualifies
+MIN_VALUE = 1.0                           # published quantiles stay strictly positive
+MAX_VALUE = 1e9                           # ... and below this ceiling
 
 
 def round2(x: float):
+    """Round half-up to two decimals, mirroring JS Math.round(x*100)/100."""
     scaled = x * 100
     whole = math.floor(scaled)
     if scaled - whole >= 0.5:
@@ -41,74 +46,123 @@ def parse_iso(s: str):
     return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def median_and_sd(logs: list):
-    if len(logs) == 1:
-        return logs[0], 0.0
-    return statistics.median(logs), statistics.pstdev(logs)
+def median(values: list):
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2:
+        return float(ordered[mid])
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
-def comparable_curves(case: dict):
-    """For each comparable, the 23 log-ratios of its release day to hour 1."""
+def pstdev(values: list, mean: float) -> float:
+    return math.sqrt(sum((v - mean) ** 2 for v in values) / len(values))
+
+
+def release_day_series(comp: dict) -> dict:
+    """Whole-hour viewer prints of one comparable's own release day.
+
+    Hour 1 is the first whole hour at or after ``day_start``; hour h therefore
+    starts at ``day_start + (h-1) hours``. Rows outside the 24-hour window are
+    ignored and the first row seen wins each hour.
+    """
+    day = parse_iso(comp["day_start"])
+    day_end = day + datetime.timedelta(hours=24)
+    by_hour = {}
+    for row in comp.get("hourly") or []:
+        t = parse_iso(row["from"])
+        if day <= t < day_end:
+            h = int((t - day).total_seconds() // 3600) + 1
+            if h not in by_hour:
+                by_hour[h] = row["viewers"]
+    return by_hour
+
+
+def comparable_log_curves(case: dict) -> list:
+    """One 23-entry log-ratio curve per comparable worth learning from."""
     curves = []
-    for comp in case.get("comparables", []):
-        day = parse_iso(comp["day_start"])
-        by_hour = {}
-        for row in comp.get("hourly") or []:
-            t = parse_iso(row["from"])
-            if day <= t < day + datetime.timedelta(hours=24):
-                h = int((t - day).total_seconds() // 3600) + 1
-                if h not in by_hour:
-                    by_hour[h] = row["viewers"]
-        p1 = by_hour.get(1)
-        if not p1 or p1 <= 0:
+    for comp in case.get("comparables") or []:
+        by_hour = release_day_series(comp)
+        p1 = by_hour.get(FIRST_HOUR)
+        if p1 is None or p1 < MIN_COMPARABLE_VIEWERS:
             continue
-        if p1 < 2000:
-            continue
-        logs = [math.log(max(by_hour.get(h, p1), 1) / p1) for h in range(2, 25)]
-        curves.append(logs)
+        curves.append([math.log(max(by_hour.get(h, p1), 1) / p1) for h in HOURS])
     return curves
 
 
-def hour_params(curves: list):
-    mu, sd = [], []
+def curve_params(curves: list):
+    """Per-hour median and floored population stddev of the log ratios."""
     if not curves:
-        return [0.0] * 23, [0.20] * 23
-    for h in range(23):
-        col = [c[h] for c in curves]
-        m, s = median_and_sd(col)
+        return [0.0] * len(HOURS), [SD_FALLBACK] * len(HOURS)
+    mu, sd = [], []
+    for i in range(len(HOURS)):
+        col = [curve[i] for curve in curves]
+        m = median(col)
         mu.append(m)
-        sd.append(max(s, 0.12))
+        sd.append(max(pstdev(col, m), SD_FLOOR))
     return mu, sd
 
 
-def hour_quantiles(p1: float, h: int, mu: list, sd: list):
-    i = h - 2
-    return [round2(p1 * math.exp(mu[i] + z * sd[i])) for z in Z]
+def first_hour_print(case: dict, name: str) -> float:
+    for row in case.get("known") or []:
+        if row.get("hour") == FIRST_HOUR:
+            return max(1, row["viewers"])
+    raise ValueError(f"{name}: no hour-1 viewer print in 'known'")
+
+
+def hour_band(p1: float, i: int, mu: list, sd: list) -> list:
+    m, s = mu[i], sd[i]
+    return [round2(p1 * math.exp(m + z * s)) for z in Z]
+
+
+def check_payload(payload: dict, name: str) -> None:
+    """Assert the published shape the scorer requires; fail loudly, not silently.
+
+    Guards the stated invariants of one answer: exactly hours 2..24 in order,
+    five quantiles per hour, each finite and inside (0, 1e9], and a
+    non-decreasing band.
+    """
+    rows = payload["hours"]
+    if [row["hour"] for row in rows] != list(HOURS):
+        raise ValueError(f"{name}: expected hours 2..24, got {[row['hour'] for row in rows]}")
+    for row in rows:
+        q = row["q"]
+        if len(q) != len(Z):
+            raise ValueError(f"{name}: hour {row['hour']} has {len(q)} quantiles, expected {len(Z)}")
+        for v in q:
+            if not isinstance(v, (int, float)) or not math.isfinite(v):
+                raise ValueError(f"{name}: hour {row['hour']} has a non-finite quantile {v!r}")
+            if not MIN_VALUE <= v <= MAX_VALUE:
+                raise ValueError(f"{name}: hour {row['hour']} quantile {v!r} outside bounds")
+        if any(q[i] > q[i + 1] for i in range(len(q) - 1)):
+            raise ValueError(f"{name}: hour {row['hour']} band is not non-decreasing: {q}")
 
 
 def forecast_case(case: dict, name: str) -> dict:
-    first = next((k for k in case["known"] if k["hour"] == 1), None)
-    if first is None:
-        raise ValueError(f"{name} has no hour-1 print")
-    p1 = max(1, first["viewers"])
-    mu, sd = hour_params(comparable_curves(case))
+    p1 = first_hour_print(case, name)
+    mu, sd = curve_params(comparable_log_curves(case))
     rows = []
-    for row in case["forecast"]:
-        h = row["hour"]
-        q = [min(max(x, 1.0), 1e9) for x in hour_quantiles(p1, h, mu, sd)]
-        q.sort()
+    for i, h in enumerate(HOURS):
+        q = [min(max(v, MIN_VALUE), MAX_VALUE) for v in hour_band(p1, i, mu, sd)]
+        q.sort()  # clamping cannot reorder a valid band, but ordering is a stated invariant
         rows.append({"hour": h, "q": q})
     return {"hours": rows}
+
+
+def write_atomic(path: Path, text: str) -> None:
+    """Publish via a sibling temp file so no partial .out is ever visible."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     for path in sorted(INPUT_DIR.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case, path.name)
-        (OUTPUT_DIR / f"{path.stem}.out").write_text(
-            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8"
-        )
+        payload = forecast_case(json.loads(path.read_text(encoding="utf-8")), path.name)
+        check_payload(payload, path.name)
+        text = json.dumps(payload, separators=(",", ":")) + "\n"
+        write_atomic(OUTPUT_DIR / f"{path.stem}.out", text)
 
 
 if __name__ == "__main__":
